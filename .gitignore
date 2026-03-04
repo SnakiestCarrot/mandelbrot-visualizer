@@ -2,4 +2,5 @@ frames
 frames_gpu
 frames_multi
 frames_numba
+frames_quadtree
 .venv

@@ -3,15 +3,16 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import time
 import os
+import argparse
 import multiprocessing
 from numba import jit
 
 # --- CONFIGURATION ---
 WIDTH, HEIGHT = 1000, 1000  # High res to make the CPU work hard
-MAX_ITER = 13000
-FRAMES = 60                 # More frames = better parallel demonstration
+MAX_ITER = 256
+FRAMES = 5                 # More frames = better parallel demonstration
 START_ZOOM = 1.0
-END_ZOOM = 1000000000.0       # Deep zoom
+END_ZOOM = 100.0       # Deep zoom
 CENTER_REAL = -0.7436438870371587
 CENTER_IMAG = 0.13182590420531197
 SHOW_BLOCKS = False         # Turn off for production run to save disk I/O time
@@ -81,62 +82,83 @@ def mariani_silver(x, y, w, h, img_buffer, block_list,
 # This runs on a separate CPU core. It needs all data required to make ONE frame.
 def process_frame(args):
     """
-    args is a tuple: (frame_index, zoom, r_min, i_min, dx, dy)
+    args is a tuple: (frame_index, zoom, r_min, i_min, dx, dy, no_output)
     """
-    idx, zoom, r_min, i_min, dx, dy = args
-    
+    idx, zoom, r_min, i_min, dx, dy, no_output = args
+
     # Each process needs its own buffer (processes don't share memory by default)
     local_buffer = np.zeros((HEIGHT, WIDTH), dtype=np.int32)
     local_blocks = []
-    
+
     # Run the Quadtree Algorithm
     start_t = time.time()
     mariani_silver(0, 0, WIDTH, HEIGHT, local_buffer, local_blocks, r_min, i_min, dx, dy, MAX_ITER)
     calc_time = time.time() - start_t
-    
-    # Save the image immediately (Distributed I/O)
-    # This prevents the Main process from getting bottled up saving 50 images at the end.
-    my_dpi = 100
-    fig_w, fig_h = WIDTH / my_dpi, HEIGHT / my_dpi
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=my_dpi)
-    ax.imshow(local_buffer, cmap='magma', origin='upper', interpolation='nearest')
-    ax.axis('off')
-    plt.subplots_adjust(0,0,1,1,0,0)
-    ax.margins(0,0)
-    
-    if SHOW_BLOCKS:
-        for (bx, by, bw, bh) in local_blocks:
-            if bw > 4 or bh > 4:
-                rect = patches.Rectangle((bx, by), bw, bh, linewidth=0.5, edgecolor='r', facecolor='none', alpha=0.5)
-                ax.add_patch(rect)
-                
-    filename = f"frames_multi/frame_{idx:03d}.png"
-    plt.savefig(filename, dpi=my_dpi, pad_inches=0)
-    plt.close(fig)
-    
+
+    if not no_output:
+        # Save the image immediately (Distributed I/O)
+        # This prevents the Main process from getting bottled up saving 50 images at the end.
+        my_dpi = 100
+        fig_w, fig_h = WIDTH / my_dpi, HEIGHT / my_dpi
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=my_dpi)
+        ax.imshow(local_buffer, cmap='magma', origin='upper', interpolation='nearest')
+        ax.axis('off')
+        plt.subplots_adjust(0,0,1,1,0,0)
+        ax.margins(0,0)
+
+        if SHOW_BLOCKS:
+            for (bx, by, bw, bh) in local_blocks:
+                if bw > 4 or bh > 4:
+                    rect = patches.Rectangle((bx, by), bw, bh, linewidth=0.5, edgecolor='r', facecolor='none', alpha=0.5)
+                    ax.add_patch(rect)
+
+        filename = f"frames_multi/frame_{idx:03d}.png"
+        plt.savefig(filename, dpi=my_dpi, pad_inches=0)
+        plt.close(fig)
+
     return idx, calc_time
 
 # --- 4. MAIN CONTROLLER ---
 def main():
+    global WIDTH, HEIGHT, MAX_ITER, FRAMES, START_ZOOM, END_ZOOM
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--no-output', action='store_true', help='Skip saving output files (for benchmarking)')
+    parser.add_argument('--width', type=int, default=WIDTH, help='Image width in pixels')
+    parser.add_argument('--height', type=int, default=HEIGHT, help='Image height in pixels')
+    parser.add_argument('--max-iter', type=int, default=MAX_ITER, help='Maximum iterations per pixel')
+    parser.add_argument('--frames', type=int, default=FRAMES, help='Number of zoom frames')
+    parser.add_argument('--start-zoom', type=float, default=START_ZOOM, help='Starting zoom level')
+    parser.add_argument('--end-zoom', type=float, default=END_ZOOM, help='Ending zoom level')
+    args = parser.parse_args()
+
+    WIDTH = args.width
+    HEIGHT = args.height
+    MAX_ITER = args.max_iter
+    FRAMES = args.frames
+    START_ZOOM = args.start_zoom
+    END_ZOOM = args.end_zoom
+
     print(f"--- STARTING MULTIPROCESSING RENDER ---")
     print(f"Cores Available: {multiprocessing.cpu_count()}")
     print(f"Task: Render {FRAMES} frames from Zoom {START_ZOOM}x to {END_ZOOM}x")
-    
-    if not os.path.exists('frames_multi'):
-        os.makedirs('frames_multi')
+
+    if not args.no_output:
+        if not os.path.exists('frames_multi'):
+            os.makedirs('frames_multi')
 
     # Prepare the Job Queue
     tasks = []
     zooms = np.geomspace(START_ZOOM, END_ZOOM, FRAMES)
-    
+
     for i, z in enumerate(zooms):
         view_w, view_h = 4.0/z, 4.0/z
         r_min = CENTER_REAL - view_w/2.0
         i_min = CENTER_IMAG - view_h/2.0
         dx, dy = view_w/WIDTH, view_h/HEIGHT
-        
+
         # Pack arguments
-        tasks.append((i, z, r_min, i_min, dx, dy))
+        tasks.append((i, z, r_min, i_min, dx, dy, args.no_output))
 
     global_start = time.time()
 
@@ -157,7 +179,7 @@ def main():
     
     print("-" * 40)
     print(f"Total Batch Time: {total_time:.2f}s")
-    print(f"Average Time per Frame: {total_time/FRAMES:.2f}s")
+    print(f"Average Time per Frame: {total_time/args.frames:.2f}s")
     print(f"Theoretical Speedup: Check against your Serial Baseline!")
 
 if __name__ == "__main__":
